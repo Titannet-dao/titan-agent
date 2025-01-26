@@ -22,23 +22,18 @@ const (
 type AgentArguments struct {
 	WorkingDir     string
 	ScriptFileName string
-
 	ScriptInvterval int
-
-	ServerURL string
-	Channel   string
-	Key       string
+	ServerURL      string
+	Channel        string
+	Key            string
 }
 
 type Agent struct {
 	agentVersion string
-
-	args *AgentArguments
-
-	baseInfo *BaseInfo
-	script   *Script
-
-	scriptFileMD5     string
+	args         *AgentArguments
+	baseInfo     *BaseInfo
+	script       *Script
+	scriptFileMD5 string
 	scriptFileContent []byte
 }
 
@@ -63,9 +58,9 @@ func New(args *AgentArguments) (*Agent, error) {
 		baseInfo:     NewBaseInfo(&agentInfo, nil),
 	}
 
-	err := os.MkdirAll(args.WorkingDir, os.ModePerm)
-	if err != nil {
-		return nil, err
+	// Create a working directory if it doesn't exist
+	if err := os.MkdirAll(args.WorkingDir, os.ModePerm); err != nil {
+		return nil, fmt.Errorf("failed to create working directory: %v", err)
 	}
 
 	return agent, nil
@@ -76,70 +71,71 @@ func (a *Agent) Version() string {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	a.loadLocal()
+	// Load the local script and update it from the server
+	if err := a.loadLocal(); err != nil {
+		return err
+	}
 	a.updateScriptFromServer()
 	a.renewScript()
 
-	scriptUpdateinterval := time.Second * time.Duration(a.args.ScriptInvterval)
+	scriptUpdateinterval := time.Duration(a.args.ScriptInvterval) * time.Second
 	ticker := time.NewTicker(scriptUpdateinterval)
-	scriptUpdateTime := time.Now()
-	loop := true
 	defer ticker.Stop()
 
-	for loop {
-		script := a.currentScript()
-		select {
-		case ev := <-script.Events():
-			script.HandleEvent(ev)
-		case <-ticker.C:
-			elapsed := time.Since(scriptUpdateTime)
-			if elapsed > scriptUpdateinterval {
-				a.updateScriptFromServer()
+	scriptUpdateTime := time.Now()
 
-				if a.scriptFileMD5 != script.fileMD5 {
+	for {
+		select {
+		case ev := <-a.currentScript().Events():
+			a.currentScript().HandleEvent(ev)
+		case <-ticker.C:
+			if time.Since(scriptUpdateTime) > scriptUpdateinterval {
+				a.updateScriptFromServer()
+				if a.scriptFileMD5 != a.script.fileMD5 {
 					a.renewScript()
 				}
-
 				scriptUpdateTime = time.Now()
 			}
 		case <-ctx.Done():
-			script.Stop()
+			a.currentScript().Stop()
 			log.Info("ctx done, Run() will quit")
-			loop = false
+			return nil
 		}
 	}
-
-	return nil
 }
 
 func (a *Agent) updateScriptFromServer() {
-	log.Info("updateScriptFromServer")
+	log.Info("Checking for script updates from server...")
+
 	updateConfig, err := a.getUpdateConfigFromServer()
 	if err != nil {
-		log.Errorf("updateScriptFromServer get update config: %s", err.Error())
+		log.Errorf("Failed to get update config: %v", err)
 		return
 	}
+
 	if a.scriptFileMD5 == updateConfig.MD5 {
+		log.Info("Script is up-to-date")
 		return
 	}
 
 	buf, err := a.getScriptFromServer(updateConfig.URL)
 	if err != nil {
-		log.Errorf("updateScriptFromServer get script:%s", err.Error())
+		log.Errorf("Failed to get script: %v", err)
 		return
 	}
 
 	newFileMD5 := fmt.Sprintf("%x", md5.Sum(buf))
 	if newFileMD5 != updateConfig.MD5 {
-		log.Errorf("Server script file md5 not match")
+		log.Errorf("MD5 mismatch for the script from server")
 		return
 	}
 
 	a.scriptFileContent = buf
 	a.scriptFileMD5 = updateConfig.MD5
-	a.updateScriptFile(buf)
-
-	log.Info("update script file, md5 ", updateConfig.MD5)
+	if err := a.updateScriptFile(buf); err != nil {
+		log.Errorf("Failed to update script file: %v", err)
+	}
+	log.Info("Script updated successfully")
 }
 
 func (a *Agent) currentScript() *Script {
@@ -147,68 +143,43 @@ func (a *Agent) currentScript() *Script {
 }
 
 func (a *Agent) renewScript() {
-	oldScript := a.script
-	if oldScript != nil {
+	if oldScript := a.script; oldScript != nil {
 		oldScript.Stop()
 	}
 
 	newScript := NewScript(a.baseInfo, a.scriptFileMD5, a.scriptFileContent)
 	newScript.Start()
-
 	a.script = newScript
 }
 
-func (a *Agent) loadLocal() {
-	p := path.Join(a.args.WorkingDir, a.args.ScriptFileName)
-	b, err := os.ReadFile(p)
+func (a *Agent) loadLocal() error {
+	filePath := path.Join(a.args.WorkingDir, a.args.ScriptFileName)
+	content, err := os.ReadFile(filePath)
 	if err != nil {
-		log.Errorf("loadLocal ReadFile file failed:%v", err)
-		return
+		return fmt.Errorf("failed to load local script: %v", err)
 	}
 
-	a.scriptFileContent = b
-	a.scriptFileMD5 = fmt.Sprintf("%x", md5.Sum(b))
+	a.scriptFileContent = content
+	a.scriptFileMD5 = fmt.Sprintf("%x", md5.Sum(content))
+	return nil
 }
 
 func (a *Agent) getUpdateConfigFromServer() (*UpdateConfig, error) {
 	devInfoQuery := a.baseInfo.ToURLQuery()
-
 	url := fmt.Sprintf("%s/update/lua?%s", a.args.ServerURL, devInfoQuery.Encode())
 
-	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("getScriptInfoFromServer status code: %d, msg: %s, url: %s", resp.StatusCode, string(body), url)
-	}
-
-	// Read and handle the response
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	updateConfig := &UpdateConfig{}
-	err = json.Unmarshal(body, updateConfig)
-	if err != nil {
-		return nil, nil
-	}
-	return updateConfig, nil
+	return a.getResponse(url, &UpdateConfig{})
 }
 
 func (a *Agent) getScriptFromServer(url string) ([]byte, error) {
+	body, err := a.getResponse(url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func (a *Agent) getResponse(url string, responseBody interface{}) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), httpTimeout)
 	defer cancel()
 
@@ -223,30 +194,33 @@ func (a *Agent) getScriptFromServer(url string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("getScriptFromServer status code: %d, msg: %s, url: %s", resp.StatusCode, string(body), url)
+		return nil, fmt.Errorf("HTTP request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Read and handle the response
+	if responseBody != nil {
+		if err := json.NewDecoder(resp.Body).Decode(responseBody); err != nil {
+			return nil, fmt.Errorf("failed to parse response body: %v", err)
+		}
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-
 	return body, nil
 }
 
 func (a *Agent) updateScriptFile(scriptContent []byte) error {
-	err := os.MkdirAll(a.args.WorkingDir, os.ModePerm)
-	if err != nil {
-		return err
+	if err := os.MkdirAll(a.args.WorkingDir, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
 	}
 
 	filePath := path.Join(a.args.WorkingDir, a.args.ScriptFileName)
 	f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open script file: %v", err)
 	}
 	defer f.Close()
 
