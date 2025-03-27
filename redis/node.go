@@ -213,7 +213,6 @@ func (r *Redis) IncrNodeOnlineDuration(ctx context.Context, nodeid string, secon
 
 	todayOnlineKey := fmt.Sprintf(RedisKeyNodeOnlineDurationByDate, nodeid, time.Now().Format("20060102"))
 	return r.client.IncrBy(ctx, todayOnlineKey, int64(seconds)).Err()
-
 }
 
 func (r *Redis) GetNodeOnlineDuration(ctx context.Context, nodeid string) (int64, error) {

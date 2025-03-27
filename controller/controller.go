@@ -143,7 +143,7 @@ func (c *Controller) registBindInfo(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal bind request: %s", err.Error())
 	}
-
+  
 	webUrl := c.baseInfo.GetWebServer()
 	if webUrl != "" {
 		webUrl += "/api/network/bind_node"
@@ -541,7 +541,7 @@ func (c *Controller) updateAppsFromServer() (bool, error) {
 		return false, err
 	}
 
-	c.appConfigsMD5 = c.configMD5(newAppConfigs) // what's this for ?
+	c.appConfigsMD5 = c.configMD5(newAppConfigs) 
 	c.appConfigs = newAppConfigs
 
 	return true, nil

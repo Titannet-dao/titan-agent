@@ -55,7 +55,7 @@ func (a *auth) proxy(next http.HandlerFunc) http.HandlerFunc {
 		if token == "" {
 			token = r.URL.Query().Get("token")
 		}
-
+    
 		if token == "" {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -267,7 +267,6 @@ func replaceIfTestApp(nodeid string, apps *[]*AppConfig) {
 		}
 	}
 }
-
 func (h *ServerHandler) handleGetAppsConfig(w http.ResponseWriter, r *http.Request) {
 	log.Infof("handleGetAppsConfig, queryString %s\n", r.URL.RawQuery)
 	payload, err := parseTokenFromRequestContext(r.Context())
@@ -278,6 +277,7 @@ func (h *ServerHandler) handleGetAppsConfig(w http.ResponseWriter, r *http.Reque
 	}
 
 	d := NewDeviceFromURLQuery(r.URL.Query())
+
 
 	uuid := r.URL.Query().Get("uuid")
 	channel := r.URL.Query().Get("channel")
@@ -709,6 +709,7 @@ func (h *ServerHandler) handleGetAppInfo(w http.ResponseWriter, r *http.Request)
 	// 	apiResultErr(w, err.Error())
 	// 	return
 	// }
+
 
 	if app.AppName == "titan-l2" && len(res.NodeID) == 0 {
 		apiResultErr(w, "titan-l2 not exist")
