@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>远程 Shell 控制</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; }
+        h1 { color: #333; }
+        .session-container { max-width: 800px; margin-top: 20px; }
+        .session { background: white; border-radius: 8px; padding: 10px; margin-bottom: 10px; box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.2); }
+        .session h3 { margin: 0; color: #007bff; font-size: 16px; }
+        .stdout { color: #28a745; white-space: pre-wrap; margin-top: 5px; }
+        .stderr { color: red; white-space: pre-wrap; margin-top: 5px; }
+        .clear-btn { padding: 5px 10px; border: none; background: #dc3545; color: white; border-radius: 5px; cursor: pointer; }
+        .clear-btn:hover { background: #c82333; }
+        .send-btn { padding: 5px 15px; border: none; background: #007bff; color: white; border-radius: 5px; cursor: pointer; }
+        .send-btn:hover { background: #0056b3; }
+    </style>
+</head>
+<body>
+
+    <h1>远程 Shell 控制</h1>
+
+    <div>
+        <label>选择节点:</label>
+        <select id="nodeSelect"></select>
+    </div>
+    <div>
+        <label>命令:</label>
+        <input type="text" id="cmd" value="ls -al">
+        <button onclick="sendCmd()" class="send-btn">执行</button>
+        <button onclick="clearOutput()" class="clear-btn">清空</button>
+    </div>
+
+    <div class="session-container" id="output"></div>
+
+    <script>
+    function generateUUID() {
+        if (window.crypto && window.crypto.randomUUID) {
+            return window.crypto.randomUUID();
+        } else {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+                let r = (Math.random() * 16) | 0;
+                let v = c === 'x' ? r : (r & 0x3) | 0x8;
+                return v.toString(16);
+            });
+        }
+    }
+
+    function addSession(data) {
+        let sessionContainer = document.getElementById("output");
+
+        // 创建会话容器
+        let sessionDiv = document.createElement("div");
+        sessionDiv.classList.add("session");
+
+        // 添加命令标题
+        let timestamp = new Date().toLocaleTimeString();
+        let title = document.createElement("h3");
+        title.innerHTML = `${timestamp} - <b>命令输出:</b>`;
+        sessionDiv.appendChild(title);
+
+        // 处理标准输出
+        if (data.stdout.trim()) {
+            let stdoutDiv = document.createElement("div");
+            stdoutDiv.classList.add("stdout");
+            stdoutDiv.innerHTML = `<b>输出:</b><br>${data.stdout.replace(/\n/g, "<br>")}`;
+            sessionDiv.appendChild(stdoutDiv);
+        }
+
+        // 处理错误输出（仅在 stderr 非空时显示）
+        if (data.stderr.trim()) {
+            let stderrDiv = document.createElement("div");
+            stderrDiv.classList.add("stderr");
+            stderrDiv.innerHTML = `<b>错误:</b><br>${data.stderr.replace(/\n/g, "<br>")}`;
+            sessionDiv.appendChild(stderrDiv);
+        }
+
+        // 将新会话插入到页面顶部
+        sessionContainer.prepend(sessionDiv);
+    }
+
+
+    let ws;
+
+    function connectWebSocket() {
+        let wsProtocol = window.location.protocol === "https:" ? "wss://" : "ws://";
+        let wsHost = window.location.host;
+        let wsUrl = wsProtocol + wsHost + "/ws/web";
+
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => console.log("连接服务器成功");
+
+        ws.onmessage = (e) => {
+            let data = e.data;
+
+            if (data.startsWith("NODES:")) {
+                updateNodeList(data.replace("NODES:", "").split(","));
+            } else {
+                try {
+                    if (typeof data !== "string") {
+                        console.error("收到非字符串数据:", data);
+                        return;
+                    }
+
+                    let jsonData = JSON.parse(data.trim());
+
+                    if (jsonData && typeof jsonData === "object") {
+                        addSession(jsonData);
+                    } else {
+                        console.error("解析后的 JSON 不是对象:", jsonData);
+                    }
+                } catch (error) {
+                    console.error("JSON 解析失败:", error, "收到的数据:", data);
+                }
+            }
+        };
+
+        ws.onclose = () => {
+            console.log("WebSocket 断开，5秒后重连...");
+            setTimeout(connectWebSocket, 5000);
+        };
+    }
+
+    connectWebSocket();
+
+    function updateNodeList(nodes) {
+        let select = document.getElementById("nodeSelect");
+        select.innerHTML = "";
+        nodes.forEach(node => {
+            if (node.trim() !== "") {  
+                let option = document.createElement("option");
+                option.value = node;
+                option.text = node;
+                select.appendChild(option);
+            }
+        });
+    }
+
+    function sendCmd() {
+        let node = document.getElementById("nodeSelect").value;
+        let cmd = document.getElementById("cmd").value;
+        ws.send(node + ":" + cmd);
+    }
+
+    function clearOutput() {
+        document.getElementById("output").innerHTML = "";
+    }
+    </script>
+
+</body>
+</html>

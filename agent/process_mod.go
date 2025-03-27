@@ -58,7 +58,7 @@ func (pm *ProcessModule) createProcessStub(L *lua.LState) int {
 	command := L.ToString(2)
 	envStr := L.ToString(3)
 
-	log.Infof("createProcessStub name:%s", name)
+	log.Infof("createProcessStub name:%s, command:%s", name, command)
 	// log.Infof("createProcessStub command:%s\n, envStr:%s", command, envStr)
 
 	if len(name) < 1 {

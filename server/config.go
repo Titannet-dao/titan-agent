@@ -12,6 +12,7 @@ import (
 )
 
 type Config struct {
+	ListenOn          string            `json:"listenOn" yaml:"listenOn"`
 	DefaultLuaScript  string            `json:"defaultLuaScript" yaml:"defaultLuaScript"`
 	DefaultController map[string]string `json:"defaultController" yaml:"defaultController"`
 	DefaultApp        map[string]string `json:"defaultApp" yaml:"defaultApp"`
@@ -25,7 +26,10 @@ type Config struct {
 	ChannelApps        map[string][]string  `json:"channelApps" yaml:"channelApps"`
 
 	RedisAddr  string `json:"redisAddr" yaml:"redisAddr"`
+	RedisPass  string `json:"redisPass" yaml:"redisPass"`
 	PrivateKey string `json:"privateKey" yaml:"privateKey"`
+
+	WebServer string `json:"webServer" yaml:"webServer"`
 }
 
 type FileConfig struct {
@@ -45,12 +49,14 @@ type AppConfig struct {
 	ScriptMD5    string   `json:"scriptMD5" yaml:"scriptMD5"`
 	ScriptURL    string   `json:"scriptURL" yaml:"scriptURL"`
 	ReqResources []string `json:"reqResources" yaml:"reqResources"`
+	ReqLocations []string `json:"reqLocations" yaml:"reqLocations"`
 	Tag          string   `json:"tag" yaml:"tag"`
 }
 
 type Resource struct {
 	Name        string `json:"name" yaml:"name"`
 	OS          string `json:"os" yaml:"os"`
+	Arch        string `json:"arch" yaml:"arch"`
 	MinCPU      int    `json:"minCPU" yaml:"minCPU"`
 	MinMemoryMB int64  `json:"minMemoryMB" yaml:"minMemoryMB"`
 	MinDiskGB   int64  `json:"minDiskGB" yaml:"minDiskGB"`

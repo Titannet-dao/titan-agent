@@ -22,6 +22,7 @@ type Device struct {
 	CPUModuleName string
 	CPUCores      int
 	CPUMhz        float64
+	CPUUsage      float64
 	Gpu           string
 
 	TotalMemory     int64
@@ -49,6 +50,8 @@ type Device struct {
 
 	WorkingDir string
 	Channel    string
+
+	Version string
 }
 
 func NewDeviceFromURLQuery(values url.Values) *Device {
@@ -66,7 +69,9 @@ func NewDeviceFromURLQuery(values url.Values) *Device {
 	d.Macs = values.Get("macs")
 	d.CPUModuleName = values.Get("cpuModuleName")
 	d.CPUCores = stringToInt(values.Get("cpuCores"))
+	d.CPUUsage = stringToFloat64(values.Get("cpuUsage"))
 	d.CPUMhz = stringToFloat64(values.Get("cpuMhz"))
+
 	d.Gpu = values.Get("gpu")
 
 	d.TotalMemory = stringToInt64(values.Get("totalmemory"))
@@ -80,11 +85,11 @@ func NewDeviceFromURLQuery(values url.Values) *Device {
 
 	d.NetIRate = stringToFloat64(values.Get("netIRate"))
 	d.NetORate = stringToFloat64(values.Get("netORate"))
-
 	d.Baseboard = values.Get("baseboard")
 
 	d.WorkingDir = values.Get("workingDir")
 	d.Channel = values.Get("channel")
+	d.Version = values.Get("version")
 
 	return d
 }
@@ -103,3 +108,18 @@ func stringToFloat64(v string) float64 {
 	i, _ := strconv.ParseFloat(v, 64)
 	return i
 }
+
+// func toRedisNode(d *Device) *redis.Node {
+// 	if d.AndroidSerialNumber != "" && redis.BoxSNPattern.MatchString(d.AndroidSerialNumber) {
+// 		ok, err := dm.redis.CheckExist(context.Background(), []string{c.AndroidSerialNumber})
+// 		if err != nil {
+// 			log.Errorf("updateController redis.CheckExist error: %v", err)
+// 			return
+// 		}
+// 		if !ok {
+// 			log.Errorf("updateController serialNumber not in whitelist: %s", c.AndroidSerialNumber)
+// 			return
+// 		}
+// 	}
+
+// }

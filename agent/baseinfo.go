@@ -55,6 +55,7 @@ type BaseInfo struct {
 	platformVersion string
 	bootTime        int64
 	arch            string
+	version         string
 
 	macs string
 
@@ -86,6 +87,8 @@ type BaseInfo struct {
 	agentInfo *AgentInfo
 
 	appInfo *AppInfo
+
+	webServer string
 }
 
 func NewBaseInfo(agentInfo *AgentInfo, appInfo *AppInfo) *BaseInfo {
@@ -94,7 +97,7 @@ func NewBaseInfo(agentInfo *AgentInfo, appInfo *AppInfo) *BaseInfo {
 		log.Printf("Get host info failed: %v", err)
 	}
 
-	baseInfo := &BaseInfo{agentInfo: agentInfo, appInfo: appInfo}
+	baseInfo := &BaseInfo{agentInfo: agentInfo, appInfo: appInfo, version: version}
 	// host info
 	if info != nil {
 		baseInfo.hostName = info.Hostname
@@ -197,6 +200,10 @@ func (baseInfo *BaseInfo) getAndroidID() {
 	}
 
 	baseInfo.androidID = androidID
+}
+
+func (b *BaseInfo) IsBox() bool {
+	return isBox
 }
 
 func (baseInfo *BaseInfo) getUUID() {
@@ -345,6 +352,7 @@ func (baseInfo *BaseInfo) ToURLQuery() url.Values {
 	query.Add("platformVersion", baseInfo.platformVersion)
 	query.Add("bootTime", fmt.Sprintf("%d", baseInfo.bootTime))
 	query.Add("arch", baseInfo.arch)
+	query.Add("version", baseInfo.version)
 
 	query.Add("macs", baseInfo.macs)
 
@@ -396,6 +404,7 @@ func (baseInfo *BaseInfo) ToLuaTable(L *lua.LState) *lua.LTable {
 	t.RawSet(lua.LString("platformVersion"), lua.LString(baseInfo.platformVersion))
 	t.RawSet(lua.LString("bootTime"), lua.LNumber(baseInfo.bootTime))
 	t.RawSet(lua.LString("arch"), lua.LString(baseInfo.arch))
+	t.RawSet(lua.LString("version"), lua.LString(baseInfo.version))
 
 	t.RawSet(lua.LString("macs"), lua.LString(baseInfo.macs))
 
@@ -444,6 +453,8 @@ func (baseInfo *BaseInfo) ToLuaTable(L *lua.LState) *lua.LTable {
 		t.RawSet(lua.LString("channel"), lua.LString(baseInfo.appInfo.Channel))
 	}
 
+	t.RawSet(lua.LString("webServer"), lua.LString(baseInfo.webServer))
+	t.RawSet(lua.LString("isBox"), lua.LBool(isBox))
 	return t
 }
 
@@ -458,6 +469,13 @@ func (baseInfo *BaseInfo) SetTraffice(n NetworkStatsRate) {
 
 func (b *BaseInfo) SetCpuUsage(cpuUsage float64) {
 	b.cpuUsage = cpuUsage
+}
+func (b *BaseInfo) SetWebServer(webServer string) {
+	b.webServer = webServer
+}
+
+func (b *BaseInfo) GetWebServer() string {
+	return b.webServer
 }
 
 func calAvg[T constraints.Integer | constraints.Float](arr []T) float64 {
