@@ -3,7 +3,11 @@ package main
 import (
 	"agent/agent"
 	"context"
-	"log"
+	"io"
+	"path"
+
+	log "github.com/sirupsen/logrus"
+
 	"os"
 	"os/signal"
 	"syscall"
@@ -53,11 +57,43 @@ func main() {
 				Usage: "--key YOUR_WEB_KEY",
 				Value: "",
 			},
+			&cli.StringFlag{
+				Name:    "log-file",
+				Usage:   "--log-file agent.log",
+				EnvVars: []string{"AGENT_LOG_FILE"},
+				Value:   "agent.log",
+			},
 		},
 		Before: func(cctx *cli.Context) error {
 			return nil
 		},
 		Action: func(cctx *cli.Context) error {
+			workingDir := cctx.String("working-dir")
+			if workingDir == "" {
+				log.Fatalf("working-dir is required")
+			}
+
+			err := os.MkdirAll(workingDir, os.ModePerm)
+			if err != nil {
+				log.Fatalf("create working-dir failed:%s", err.Error())
+			}
+
+			// set log file
+			logFile := cctx.String("log-file")
+			if logFile != "" {
+				file, err := os.OpenFile(path.Join(workingDir, logFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+				if err != nil {
+					log.Fatalf("open file %s, failed:%s", logFile, err.Error())
+				}
+				defer file.Close()
+
+				multiWriter := io.MultiWriter(os.Stdout, file)
+				log.SetOutput(multiWriter)
+
+				os.Stderr = file
+				os.Stdout = file
+			}
+
 			agrs := &agent.AgentArguments{
 				WorkingDir:     cctx.String("working-dir"),
 				ScriptFileName: cctx.String("script-file-name"),

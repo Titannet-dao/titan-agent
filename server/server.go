@@ -22,7 +22,7 @@ type Server struct {
 }
 
 func NewServer(config *Config) (*Server, error) {
-	redis := redis.NewRedis(config.RedisAddr)
+	redis := redis.NewRedis(config.RedisAddr, config.RedisPass)
 	if config.PrivateKey == "" {
 		return nil, jwt.ErrHMACMissingKey
 	}
@@ -36,15 +36,8 @@ func NewServer(config *Config) (*Server, error) {
 	s.handle("/config/controller", http.HandlerFunc(handler.handleGetControllerConfig))
 	s.handle("/config/apps", handler.auth.proxy(handler.handleGetAppsConfig))
 
-	s.handle("/agent/list", http.HandlerFunc(handler.handleAgentList))
-	s.handle("/controller/list", http.HandlerFunc(handler.handleControllerList))
-
-	s.handle("/api/applist", http.HandlerFunc(handler.handleGetAppList))
-	s.handle("/api/appinfo", http.HandlerFunc(handler.handleGetAppInfo))
 	s.handle("/api/signverify", http.HandlerFunc(handler.handleSignVerify))
-
-	s.handle("/api/nodelist", http.HandlerFunc(handler.handleGetNodeList))
-	s.handle("/api/appinfos", http.HandlerFunc(handler.handleGetAllNodesAppInfosList))
+	s.handle("/api/health", http.HandlerFunc(handler.HealthCheck))
 
 	s.handle("/push/metrics", handler.auth.proxy(handler.handlePushMetrics))
 	s.handle("/push/appinfo", handler.auth.proxy(handler.handlePushAppInfo))
@@ -52,6 +45,8 @@ func NewServer(config *Config) (*Server, error) {
 	s.handle("/node/regist", http.HandlerFunc(handler.HandleNodeRegist))
 	s.handle("/node/login", http.HandlerFunc(handler.HandleNodeLogin))
 	s.handle("/node/keepalive", handler.auth.proxy(handler.HandleNodeKeepalive))
+	s.handle("/node/next/id", http.HandlerFunc(handler.HandleNextId))
+
 	return s, nil
 }
 

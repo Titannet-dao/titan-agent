@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"reflect"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -107,10 +108,14 @@ func New(args *ConrollerArgs) (*Controller, error) {
 	log.Info("Node login success")
 	c.token = token
 
-	if err := c.registBindInfo(context.Background()); err != nil {
-		return nil, fmt.Errorf("[Bind Error]: %s", err.Error())
+	if !info.IsBox() {
+		if err := c.registBindInfo(context.Background()); err != nil {
+			return nil, fmt.Errorf("[Bind Error]: %s", err.Error())
+		}
+		log.Info("Node bind success")
+	} else {
+		log.Info("Box Node, skip bind")
 	}
-	log.Info("Node bind success")
 
 	return c, nil
 }
@@ -138,7 +143,15 @@ func (c *Controller) registBindInfo(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal bind request: %s", err.Error())
 	}
-	resp, err := http.Post(c.args.WebServerUrl, "application/json", bytes.NewReader(buf))
+
+	webUrl := c.baseInfo.GetWebServer()
+	if webUrl != "" {
+		webUrl += "/api/network/bind_node"
+	} else {
+		webUrl = c.args.WebServerUrl
+	}
+
+	resp, err := http.Post(webUrl, "application/json", bytes.NewReader(buf))
 	if err != nil {
 		return fmt.Errorf("failed to post bind req to web-server: %s", err.Error())
 	}
@@ -198,6 +211,8 @@ func (c *Controller) login(ctx context.Context) (string, error) {
 		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("regist status code: %d, msg: %s, url: %s", resp.StatusCode, string(body), url)
 	}
+
+	c.baseInfo.SetWebServer(resp.Header.Get("Web-Server"))
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -478,12 +493,12 @@ func (c *Controller) updateAppsFromServer() (bool, error) {
 	newAppConfigs := make([]*AppConfig, 0, len(appConfigs))
 	appConfigMap := make(map[string]*AppConfig)
 	for _, appConfig := range appConfigs {
+		// if appConfig.AppDir == "" || appConfig.AppName == "" || appConfig.
 		if _, ok := appConfigMap[appConfig.AppName]; ok {
 			continue
 		}
 		appConfigMap[appConfig.AppName] = appConfig
 		newAppConfigs = append(newAppConfigs, appConfig)
-
 	}
 
 	if !c.isAppsConfigChange(newAppConfigs) {
@@ -499,7 +514,7 @@ func (c *Controller) updateAppsFromServer() (bool, error) {
 
 		newMD5 := fmt.Sprintf("%x", md5.Sum(scriptContent))
 		if newMD5 != appConfig.ScriptMD5 {
-			log.Errorf("Controller.updateAppConfigAndScriptFromServer script md5 not match")
+			log.Errorf("Controller.updateAppConfigAndScriptFromServer script md5 not match, AppName: %s. server md5: %s. download md5: %s", appConfig.AppName, appConfig.ScriptMD5, newMD5)
 			return false, err
 		}
 
@@ -526,7 +541,7 @@ func (c *Controller) updateAppsFromServer() (bool, error) {
 		return false, err
 	}
 
-	c.appConfigsMD5 = c.configMD5(newAppConfigs)
+	c.appConfigsMD5 = c.configMD5(newAppConfigs) // what's this for ?
 	c.appConfigs = newAppConfigs
 
 	return true, nil
@@ -552,24 +567,32 @@ func (c *Controller) isAppsConfigChange(newAppConfigs []*AppConfig) bool {
 }
 
 func (c *Controller) isAppConfigChange(appConfig1 *AppConfig, appConfig2 *AppConfig) bool {
-	if appConfig1 == nil && appConfig2 == nil {
-		return false
-	}
 
-	b1, err := json.Marshal(appConfig1)
-	if err != nil {
-		return true
-	}
+	return !reflect.DeepEqual(appConfig1, appConfig2)
+	// // 两者均为nil 则没有变化
+	// if appConfig1 == nil && appConfig2 == nil {
+	// 	return false
+	// }
 
-	b2, err := json.Marshal(appConfig2)
-	if err != nil {
-		return true
-	}
+	// // 如果一个是nil 另一个不是 则有变化
+	// if appConfig1 == nil || appConfig2 == nil {
+	// 	return true
+	// }
 
-	config1MD5 := fmt.Sprintf("%x", md5.Sum(b1))
-	config2MD5 := fmt.Sprintf("%x", md5.Sum(b2))
+	// b1, err := json.Marshal(appConfig1)
+	// if err != nil {
+	// 	return true
+	// }
 
-	return config1MD5 != config2MD5
+	// b2, err := json.Marshal(appConfig2)
+	// if err != nil {
+	// 	return true
+	// }
+
+	// config1MD5 := fmt.Sprintf("%x", md5.Sum(b1))
+	// config2MD5 := fmt.Sprintf("%x", md5.Sum(b2))
+
+	// return config1MD5 != config2MD5
 
 }
 
@@ -607,7 +630,7 @@ func (c *Controller) getAppConfigsFromServer() ([]*AppConfig, error) {
 	appsConfigs := make([]*AppConfig, 0)
 	err = json.Unmarshal(body, &appsConfigs)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	return appsConfigs, nil
 }
