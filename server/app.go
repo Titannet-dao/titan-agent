@@ -9,4 +9,5 @@ type App struct {
 	ScriptURL  string `json:"scriptURL"`
 	Version    string `json:"version"`
 	Metric     string `json:"metric"`
+	Tag        string `json:"tag"`
 }

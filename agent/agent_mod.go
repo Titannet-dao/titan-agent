@@ -362,6 +362,8 @@ func (am *AgentModule) exec(L *lua.LState) int {
 	command := L.CheckString(1)
 	timeout := time.Duration(L.OptInt64(2, ExecTimeout)) * time.Second
 	needPrint := L.OptBool(3, false)
+	_ = needPrint
+
 	envs := L.OptString(4, "")
 
 	args := strings.Split(command, " ")

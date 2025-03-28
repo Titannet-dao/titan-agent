@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -147,7 +148,11 @@ func parseNetstatOutput(output string) (NetworkStats, error) {
 }
 
 func getNetworkStatsWindows() (NetworkStats, error) {
-	cmd := exec.Command("powershell", "-Command", `Get-Counter -Counter "\Network Interface(*)\Bytes Received/sec", "\Network Interface(*)\Bytes Sent/sec"`)
+	cmd := exec.Command("powershell", "-Command", `
+	Get-Counter -Counter "\Network Interface(*)\Bytes Received/sec", "\Network Interface(*)\Bytes Sent/sec" |
+	Select-Object -ExpandProperty CounterSamples |
+	ConvertTo-Json
+	`)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()
@@ -155,7 +160,27 @@ func getNetworkStatsWindows() (NetworkStats, error) {
 		return NetworkStats{}, err
 	}
 
-	return parseWindowsOutput(out.String())
+	type CounterSample struct {
+		Path         string  `json:"Path"`
+		InstanceName string  `json:"InstanceName"`
+		CookedValue  float64 `json:"CookedValue"`
+	}
+
+	var samples []CounterSample
+	if err := json.Unmarshal(out.Bytes(), &samples); err != nil {
+		return NetworkStats{}, fmt.Errorf("json unmarshal error: %v", err)
+	}
+
+	var totalStats NetworkStats
+	for _, s := range samples {
+		if strings.Contains(strings.ToLower(s.Path), "bytes received/sec") {
+			totalStats.Ibytes += uint64(s.CookedValue)
+		} else if strings.Contains(strings.ToLower(s.Path), "bytes sent/sec") {
+			totalStats.Obytes += uint64(s.CookedValue)
+		}
+	}
+
+	return totalStats, nil
 }
 
 func parseWindowsOutput(output string) (NetworkStats, error) {

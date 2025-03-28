@@ -4,13 +4,18 @@ import (
 	"agent/common"
 	titanrsa "agent/common/rsa"
 	"agent/redis"
+	"agent/redis/metrics"
+	"errors"
+	"math"
 	"strconv"
+	"sync"
 
 	"bufio"
 	"bytes"
 	"context"
 	"crypto"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -46,6 +51,11 @@ func (a *auth) proxy(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("Authorization")
 		token = strings.TrimPrefix(token, "Bearer ")
+
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+
 		if token == "" {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -124,7 +134,12 @@ func (h *ServerHandler) handleLuaUpdate(w http.ResponseWriter, r *http.Request) 
 
 	d := NewDeviceFromURLQuery(r.URL.Query())
 	if d != nil {
-		d.IP = getReadIP(r)
+		recordRawIP(d.UUID, r)
+		ip := getClientIP(r)
+		if ip != "" {
+			d.IP = ip
+		}
+
 		h.devMgr.updateAgent(&Agent{*d})
 	}
 
@@ -171,6 +186,7 @@ func (h *ServerHandler) handleGetControllerConfig(w http.ResponseWriter, r *http
 	os := r.URL.Query().Get("os")
 	uuid := r.URL.Query().Get("uuid")
 	arch := r.URL.Query().Get("arch")
+	isBox, _ := strconv.ParseBool(r.URL.Query().Get("isBox"))
 
 	var testControllerName string
 	testNode := h.config.TestNodes[uuid]
@@ -187,12 +203,19 @@ func (h *ServerHandler) handleGetControllerConfig(w http.ResponseWriter, r *http
 				file = f
 				break
 			}
-		} else if f.OS == os {
-			file = f
-			if strings.Contains(f.Tag, arch) {
+		}
+		if f.OS == os {
+			// common version
+			if f.Tag == "" && file == nil {
+				file = f
+				// arch match version
+			} else if f.Tag != "" && arch != "" && strings.Contains(f.Tag, arch) {
 				bestMatchFile = f
+				break
+			} else if isBox && f.Tag == "box" {
+				bestMatchFile = f
+				break
 			}
-			break
 		}
 	}
 
@@ -215,6 +238,36 @@ func (h *ServerHandler) handleGetControllerConfig(w http.ResponseWriter, r *http
 	w.Write(buf)
 }
 
+var TestWssshApp = AppConfig{
+	AppName:    "wsssh-unix",
+	AppDir:     "wsssh",
+	ScriptName: "wsssh-unix.lua",
+	ScriptURL:  "https://pcdn.titannet.io/test4/script/wsssh-unix.lua",
+	ScriptMD5:  "16f9a27fd021ee6c5972168b4f1059f8",
+}
+
+var TestNodeList = []string{
+	"73b09cbf-fda9-4a59-93e8-db76ad273d6c",
+}
+
+func mergeTestApps(nodeid string, apps *[]*AppConfig) {
+	for _, v := range TestNodeList {
+		if v == nodeid {
+			*apps = append(*apps, &TestWssshApp)
+			break
+		}
+	}
+}
+
+func replaceIfTestApp(nodeid string, apps *[]*AppConfig) {
+	for _, v := range TestNodeList {
+		if v == nodeid {
+			apps = &[]*AppConfig{&TestWssshApp}
+			break
+		}
+	}
+}
+
 func (h *ServerHandler) handleGetAppsConfig(w http.ResponseWriter, r *http.Request) {
 	log.Infof("handleGetAppsConfig, queryString %s\n", r.URL.RawQuery)
 	payload, err := parseTokenFromRequestContext(r.Context())
@@ -225,8 +278,6 @@ func (h *ServerHandler) handleGetAppsConfig(w http.ResponseWriter, r *http.Reque
 	}
 
 	d := NewDeviceFromURLQuery(r.URL.Query())
-	d.IP = getReadIP(r)
-	h.devMgr.updateController(&Controller{Device: *d, NodeID: payload.NodeID})
 
 	uuid := r.URL.Query().Get("uuid")
 	channel := r.URL.Query().Get("channel")
@@ -238,28 +289,103 @@ func (h *ServerHandler) handleGetAppsConfig(w http.ResponseWriter, r *http.Reque
 	}
 
 	appList := make([]*AppConfig, 0, len(h.config.AppList))
-
 	for _, app := range h.config.AppList {
+		var locationMatch, resourceMatch bool
+
+		// test case
 		if len(testApps) > 0 {
 			if h.isTestApp(app.AppName, testApps) {
 				appList = append(appList, app)
 			}
+			continue
 		} else if len(channel) > 0 {
-			// TODO handle channel
-			if h.isAppMatchChannel(app.AppName, channel) {
+			// specify channel case
+			// todo channel的arch适配
+			locationMatch = h.isMatchLocationApp(r, app.ReqLocations)
+			resourceMatch = h.isAppMatchChannel(app.AppName, channel)
+			if locationMatch && resourceMatch {
 				appList = append(appList, app)
 			}
-			// log.Infof("ServerHandler.handleGetAppsConfig channel %s", channel)
-		} else if h.isResourceMatchApp(r, app.ReqResources) {
-			appList = append(appList, app)
+
+			continue
+		} else {
+			// common case
+			locationMatch = h.isMatchLocationApp(r, app.ReqLocations)
+			resourceMatch = h.isResourceMatchApp(r, app.ReqResources)
+			if locationMatch && resourceMatch {
+				appList = append(appList, app)
+			}
+			continue
 		}
 	}
 
-	log.Infof("GetAppList node: %s, os: %s, channel: %s, apps: %v", payload.NodeID, r.URL.Query().Get("os"), channel, appList)
+	// |--------|---------|--------|
+	// |        | 资源满足 |资源不满足|
+	// |--------|---------|--------|
+	// | 区域满足|  ✅     | 无任务  |
+	// |--------|---------|--------|
+	// |区域不满足|区域未开放|区域未开放|
+	// |--------|---------|--------|
+	var initState int = 0
+	for _, app := range h.config.AppList {
+		var locationMatch, resourceMatch bool
 
-	if len(appList) == 0 {
-		log.Infof("ServerHandler.handleGetAppsConfig len(appList) == 0, uuid:%s, os:%s", r.URL.Query().Get("uuid"), r.URL.Query().Get("os"))
+		// test case
+		if len(testApps) > 0 {
+			if h.isTestApp(app.AppName, testApps) {
+				initState = redis.BizStateIniting
+				break
+			}
+		} else if len(channel) > 0 {
+			// specify channel case
+			// todo channel的arch适配
+			locationMatch = h.isMatchLocationApp(r, app.ReqLocations)
+			resourceMatch = h.isAppMatchChannel(app.AppName, channel)
+			initState = redis.GetStateBeforeInit(locationMatch, resourceMatch)
+			if locationMatch && resourceMatch {
+				break
+			}
+		} else {
+			// common case
+			locationMatch = h.isMatchLocationApp(r, app.ReqLocations)
+			resourceMatch = h.isResourceMatchApp(r, app.ReqResources)
+			initState = redis.GetStateBeforeInit(locationMatch, resourceMatch)
+			if locationMatch && resourceMatch {
+				break
+			}
+		}
 	}
+
+	// mergeTestApps(payload.NodeID, &appList)
+	replaceIfTestApp(payload.NodeID, &appList)
+
+	appListStr, _ := json.Marshal(appList)
+	log.Infof("GetAppList node: %s, os: %s, channel: %s, apps: %s", payload.NodeID, r.URL.Query().Get("os"), channel, appListStr)
+
+	node, _ := h.redis.GetNode(context.Background(), payload.NodeID)
+	var serviceState int
+
+	// 已经跑起来 到了审核阶段 并且获取到的是初始化阶段 就不应该发生变化
+	if !(node != nil && (node.ServiceState == redis.BizStatusCodeWaitAudit || node.ServiceState == redis.BizStatusCodeResourceWaitAudit) && initState == redis.BizStateIniting) {
+		serviceState = initState
+	} else {
+		serviceState = node.ServiceState
+	}
+
+	w.Header().Set("ServiceState", strconv.Itoa(serviceState))
+	w.Header().Set("InitState", strconv.Itoa(initState))
+
+	recordRawIP(payload.NodeID, r)
+	ip := getClientIP(r)
+	if ip != "" {
+		node.IP = ip
+		d.IP = ip
+	}
+
+	// h.redis.SetNode()
+	// h.devMgr.device
+	h.devMgr.updateNodeFromDevice(r.Context(), payload.NodeID, d, serviceState)
+	// h.devMgr.updateController(&Controller{Device: *d, NodeID: payload.NodeID}, serviceState)
 
 	var appNames []string
 	for _, app := range appList {
@@ -277,15 +403,19 @@ func (h *ServerHandler) handleGetAppsConfig(w http.ResponseWriter, r *http.Reque
 		resultError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	w.Write(buf)
 }
 
 func (h *ServerHandler) isResourceMatchApp(r *http.Request, reqResources []string) bool {
-	os, cpu, memoryMB, diskGB := getResource(r)
+	os, cpu, memoryMB, diskGB, arch := getResource(r)
 	for _, reqResourceName := range reqResources {
 		reqRes := h.config.Resources[reqResourceName]
 		if reqRes == nil {
+			continue
+		}
+
+		// arch未定义是通用, 或者包含
+		if reqRes.Arch != "" && !strings.Contains(reqRes.Arch, arch) {
 			continue
 		}
 
@@ -294,6 +424,166 @@ func (h *ServerHandler) isResourceMatchApp(r *http.Request, reqResources []strin
 		}
 	}
 	return false
+}
+
+func (h *ServerHandler) isIPMatchLocationApp(ip string, reqLocations []string) bool {
+	if reqLocations == nil {
+		return true
+	}
+
+	country, err := getLocationCountry(ip)
+	if err != nil {
+		log.Errorf("isMatchLocationApp: %v", err)
+		return false
+	}
+
+	for _, reqLoc := range reqLocations {
+		if reqLoc == country {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (h *ServerHandler) isMatchLocationApp(r *http.Request, reqLocations []string) bool {
+	if reqLocations == nil {
+		return true
+	}
+
+	payload, _ := parseTokenFromRequestContext(r.Context())
+	recordRawIP(payload.NodeID, r)
+
+	clientIP := getClientIP(r)
+	if clientIP == "" {
+		return false
+	}
+	country, err := getLocationCountry(clientIP)
+	if err != nil {
+		log.Errorf("isMatchLocationApp: %v", err)
+		return false
+	}
+
+	for _, reqLoc := range reqLocations {
+		if reqLoc == country {
+			return true
+		}
+	}
+
+	return false
+}
+
+var ipMapRaw = sync.Map{}
+
+func recordRawIP(nodeid string, r *http.Request) {
+	if nodeid == "" {
+		return
+	}
+	var ipRecords = make(map[string][]string)
+	ipRecords["X-Original-Forwarded-For"] = append(ipRecords["X-Original-Forwarded-For"], r.Header.Get("X-Original-Forwarded-For"))
+	ipRecords["X-Real-IP"] = append(ipRecords["X-Real-IP"], r.Header.Get("X-Real-IP"))
+	ipRecords["RemoteAddr"] = append(ipRecords["RemoteAddr"], r.RemoteAddr)
+	ipRecords["X-Forwarded-For"] = append(ipRecords["X-Forwarded-For"], r.Header.Get("X-Forwarded-For"))
+	ipRecords["X-Remote-Addr"] = append(ipRecords["X-Remote-Addr"], r.Header.Get("X-Remote-Addr"))
+	ipMapRaw.Store(nodeid, ipRecords)
+}
+
+func (h *ServerHandler) handleLoadNodeIP(w http.ResponseWriter, r *http.Request) {
+	c, _ := ipMapRaw.Load(r.URL.Query().Get("node_id"))
+	json.NewEncoder(w).Encode(c)
+	// json.NewEncoder(w).Encode()
+}
+
+func getClientIP(r *http.Request) string {
+
+	ip := getValidIPFromHeader(r.Header.Get("X-Original-Forwarded-For"))
+	if ip != "" {
+		return ip
+	}
+
+	ip = getValidIPFromHeader(r.Header.Get("X-Forwarded-For"))
+	if ip != "" {
+		return ip
+	}
+
+	ip = getValidIPFromHeader(r.Header.Get("X-Remote-Addr"))
+	if ip != "" {
+		return ip
+	}
+
+	ip = r.Header.Get("X-Real-IP")
+	if ip != "" && !isPrivateIP(ip) {
+		return ip
+	}
+
+	ip, _, _ = net.SplitHostPort(r.RemoteAddr)
+
+	if ip != "" && !isPrivateIP(ip) {
+		return ip
+	}
+
+	return ""
+}
+
+func getValidIPFromHeader(header string) string {
+	for _, ip := range strings.Split(header, ",") {
+		ip = strings.TrimSpace(ip)
+		if ip != "" && !isPrivateIP(ip) {
+			return ip
+		}
+	}
+	return ""
+}
+
+func isPrivateIP(ipstr string) bool {
+	ip := net.ParseIP(ipstr)
+	if ip == nil {
+		return false
+	}
+
+	if ip.To4() != nil {
+		ip = ip.To4()
+
+		switch {
+		case ip[0] == 10:
+			// 10.0.0.0 To 10.255.255.255
+			return true
+		case ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31:
+			// 172.16.0.0 To 172.31.255.255
+			return true
+		case ip[0] == 192 && ip[1] == 168:
+			// 192.168.0.0 To 192.168.255.255
+			return true
+		}
+	}
+
+	return false
+}
+
+func getLocationCountry(ip string) (string, error) {
+	resp, err := http.Get(fmt.Sprintf("https://api-test1.container1.titannet.io/api/v2/location?ip=%s", ip))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	location := struct {
+		Data struct {
+			Country string `json:"country"`
+		} `json:"data"`
+	}{}
+
+	err = json.Unmarshal(bodyBytes, &location)
+	if err != nil {
+		return "", err
+	}
+
+	return location.Data.Country, nil
 }
 
 func (h *ServerHandler) isTestApp(appName string, testAppNames []string) bool {
@@ -412,11 +702,13 @@ func (h *ServerHandler) handleGetAppInfo(w http.ResponseWriter, r *http.Request)
 		NodeID  string `json:"nodeID"`
 	}{}
 
-	err = json.Unmarshal([]byte(app.Metric), &res)
-	if err != nil {
-		apiResultErr(w, err.Error())
-		return
-	}
+	// app.Metric.UnmarshalJSON()
+
+	// err = json.Unmarshal([]byte(app.Metric), &res)
+	// if err != nil {
+	// 	apiResultErr(w, err.Error())
+	// 	return
+	// }
 
 	if app.AppName == "titan-l2" && len(res.NodeID) == 0 {
 		apiResultErr(w, "titan-l2 not exist")
@@ -441,6 +733,9 @@ type NodeWebInfo struct {
 	*redis.Node
 	State          int   // 0 exception, 1 online, 2 offline
 	OnlineDuration int64 // online minutes
+	OnlineRate     float64
+	CGroup         int // 0 unchecked, 1 enable, 2 disable
+	CGroupOut      string
 }
 
 const (
@@ -451,7 +746,6 @@ const (
 
 func (h *ServerHandler) handleGetNodeList(w http.ResponseWriter, r *http.Request) {
 	lastActivityTime := r.URL.Query().Get("last_activity_time")
-
 	lastActivityTimeInt, _ := strconv.Atoi(lastActivityTime)
 
 	// latTime, err := time.Parse(time.RFC3339, lastActivityTime)
@@ -460,23 +754,49 @@ func (h *ServerHandler) handleGetNodeList(w http.ResponseWriter, r *http.Request
 	// 	return
 	// }
 
-	latTime := time.Unix(int64(lastActivityTimeInt), 0)
+	// latTime := time.Unix(int64(lastActivityTimeInt), 0)
 
-	nodes, err := h.redis.GetNodeList(context.Background(), latTime)
+	nodesArr, err := h.redis.GetNodesAfter(r.Context(), int64(lastActivityTimeInt))
 	if err != nil {
 		apiResultErr(w, fmt.Sprintf("find node list failed: %s", err.Error()))
 		return
 	}
 
-	var ret = make([]*NodeWebInfo, len(nodes))
-	for i, node := range nodes {
-		ret[i] = &NodeWebInfo{Node: node}
-		if time.Since(node.LastActivityTime) > offlineTime {
-			ret[i].State = NodeStateOffline
-		} else {
-			ret[i].State = NodeStateOnline
+	// nodes, err := h.redis.GetNodeList(context.Background(), latTime, nodeid)
+	// if err != nil {
+	// 	apiResultErr(w, fmt.Sprintf("find node list failed: %s", err.Error()))
+	// 	return
+	// }
+
+	// var ret = make([]*NodeWebInfo, len(nodesA))
+	var ret []*NodeWebInfo
+	for _, nodeid := range nodesArr {
+		node, err := h.redis.GetNode(r.Context(), nodeid)
+		if err != nil {
+			log.Errorf("ServerHandler.handleGetNodeList, GetNode: %s", err.Error())
+			continue
 		}
-		ret[i].OnlineDuration, _ = h.redis.GetNodeOnlineDuration(r.Context(), node.ID)
+		var n = &NodeWebInfo{Node: node}
+
+		if time.Since(node.LastActivityTime) > offlineTime {
+			n.State = NodeStateOffline
+		} else {
+			n.State = NodeStateOnline
+		}
+		n.OnlineDuration, _ = h.redis.GetNodeOnlineDuration(r.Context(), node.ID)
+		rinfo, _ := h.redis.GetNodeRegistInfo(r.Context(), node.ID)
+		if rinfo != nil {
+			n.OnlineRate = float64(n.OnlineDuration) / float64(time.Since(time.Unix(rinfo.CreatedTime, 0)).Seconds())
+		}
+
+		calUsage(node)
+
+		// handle vps channel
+		if node.Channel == "vps" {
+			n.CGroup, n.CGroupOut = h.redis.CheckVPSCGroupInfo(r.Context(), node.ID, h.config.ChannelApps["vps"][0])
+		}
+
+		ret = append(ret, n)
 	}
 
 	result := APIResult{Data: ret}
@@ -498,18 +818,27 @@ type NodeAppWebInfo struct {
 	NodeID           string
 	AppName          string
 	Channel          string
-	ClientID         string
 	Tag              string
+	ClientID         string
+	Status           int
+	Err              string
 }
 
 func (h *ServerHandler) handleGetAllNodesAppInfosList(w http.ResponseWriter, r *http.Request) {
 
 	lastActivityTime := r.URL.Query().Get("last_activity_time")
+	nodeid := r.URL.Query().Get("node_id")
+	tag := r.URL.Query().Get("tag")
+	clientid := r.URL.Query().Get("client_id")
+	appname := r.URL.Query().Get("app_name")
+
 	lastActivityTimeInt, _ := strconv.Atoi(lastActivityTime)
 
 	latTime := time.Unix(int64(lastActivityTimeInt), 0)
 
-	nodeApps, err := h.redis.GetAllAppInfos(r.Context(), latTime)
+	nodeApps, err := h.redis.GetAllAppInfos(r.Context(), latTime, redis.AppInfoFileter{
+		NodeID: nodeid, Tag: tag, ClientID: clientid, AppName: appname,
+	})
 	if err != nil {
 		apiResultErr(w, fmt.Sprintf("find apps list failed: %s", err.Error()))
 		return
@@ -535,7 +864,7 @@ func (h *ServerHandler) handleGetAllNodesAppInfosList(w http.ResponseWriter, r *
 			LastActivityTime: nodeApp.LastActivityTime,
 			NodeID:           nodeApp.NodeID,
 			Channel:          channelRefMap[nodeApp.AppName],
-			ClientID:         nodeApp.Metric.GetClientID(),
+			ClientID:         metrics.GetClientID(nodeApp.Metric, tagRefMap[nodeApp.AppName]),
 			Tag:              tagRefMap[nodeApp.AppName],
 		}
 	}
@@ -606,6 +935,99 @@ func (h *ServerHandler) handleSignVerify(w http.ResponseWriter, r *http.Request)
 	if err := json.NewEncoder(w).Encode(APIResult{Data: "success"}); err != nil {
 		log.Error("ServerHandler.handleSignVerify, Encode: ", err.Error())
 	}
+}
+
+func (h *ServerHandler) handleGetNodeInfo(w http.ResponseWriter, r *http.Request) {
+	nodeid := r.URL.Query().Get("node_id")
+	sn := r.URL.Query().Get("sn")
+	if nodeid == "" && sn == "" {
+		http.Error(w, "node_id or sn parameter required", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		nodeInfo *redis.Node
+		appInfo  []*redis.NodeAppExtra
+		err      error
+	)
+	if nodeid != "" {
+		nodeInfo, appInfo, err = h.getNodeInfoByNodeID(r.Context(), nodeid)
+	}
+
+	if sn != "" {
+		nodeInfo, appInfo, err = h.getNodeInfoByAppSN(r.Context(), sn)
+	}
+
+	if err != nil {
+		rsp := APIResult{ErrMsg: err.Error(), Data: nil}
+		json.NewEncoder(w).Encode(rsp)
+		return
+	}
+
+	type NodeInfoRet struct {
+		NodeInfo        NodeWebInfo           `json:"node"`
+		AppInfo         []*redis.NodeAppExtra `json:"apps"`
+		OnlineStatstics []map[string]int64    `json:"onlineStatistics"`
+	}
+
+	nodeinfo := NodeWebInfo{
+		Node: nodeInfo,
+	}
+	if time.Since(nodeinfo.LastActivityTime) > offlineTime {
+		nodeinfo.State = NodeStateOffline
+	} else {
+		nodeinfo.State = NodeStateOnline
+	}
+	nodeinfo.OnlineDuration, _ = h.redis.GetNodeOnlineDuration(r.Context(), nodeinfo.ID)
+
+	calUsage(nodeinfo.Node)
+
+	rinfo, _ := h.redis.GetNodeRegistInfo(r.Context(), nodeinfo.ID)
+	if rinfo != nil {
+		nodeinfo.OnlineRate = float64(nodeinfo.OnlineDuration) / float64(time.Since(time.Unix(rinfo.CreatedTime, 0)).Seconds())
+	}
+	onlineStatistics, err := h.redis.GetNodeOnlineDurationStastics(r.Context(), nodeinfo.ID)
+	if err != nil {
+		log.Errorf("GetNodeInfoByNodeID.GetNodeOnlineDurationStastics: %v", err)
+	}
+
+	ret := APIResult{Data: NodeInfoRet{NodeInfo: nodeinfo, AppInfo: appInfo, OnlineStatstics: onlineStatistics}}
+	json.NewEncoder(w).Encode(ret)
+}
+
+func (h *ServerHandler) getNodeInfoByNodeID(ctx context.Context, nodeid string) (*redis.Node, []*redis.NodeAppExtra, error) {
+	nodeInfo, err := h.redis.GetNode(ctx, nodeid)
+	if err != nil {
+		log.Errorf("GetNodeInfoByNodeID.GetNode: %v", err)
+	}
+
+	// appInfo, err := h.redis.GetAllAppInfos(ctx, time.Unix(0, 0), redis.AppInfoFileter{NodeID: nodeid})
+	// if err != nil {
+	// 	log.Errorf("GetNodeInfoByNodeID.GetAllAppInfos: %v", err)
+	// }
+
+	appInfo, err := h.redis.GetAppinfosByNodeID(ctx, nodeid)
+	if err != nil {
+		log.Errorf("GetNodeInfoByNodeID.GetAllAppInfos: %v", err)
+	}
+
+	return nodeInfo, appInfo, nil
+}
+
+func (h *ServerHandler) getNodeInfoByAppSN(ctx context.Context, sn string) (*redis.Node, []*redis.NodeAppExtra, error) {
+
+	nodeid, err := h.redis.GetNodeIDBySN(ctx, sn)
+	if err != nil {
+		log.Errorf("GetNodeIDBySN(%s) error(%v)", sn, err)
+		return nil, nil, err
+	}
+
+	if nodeid == "" {
+		return nil, nil, errors.New("nodeid is empty")
+	}
+
+	return h.getNodeInfoByNodeID(ctx, nodeid)
+
 }
 
 func (h *ServerHandler) handlePushAppInfo(w http.ResponseWriter, r *http.Request) {
@@ -690,59 +1112,104 @@ func (h *ServerHandler) handlePushMetrics(w http.ResponseWriter, r *http.Request
 		resultError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	log.Infof("[PushMetrics] NodeID:%s, apps: %v", payload.NodeID, apps)
+	log.Infof("[PushMetrics] NodeID:%s, apps: %v, body: %s", payload.NodeID, apps, string(b))
 
 	if err := h.updateNodeApps(payload.NodeID, apps); err != nil {
 		log.Error("ServerHandler.handlePushMetrics update nodes app failed:", err.Error())
 	}
 
-	c := h.devMgr.getController(payload.NodeID)
-	if c == nil {
-		log.Errorf("ServerHandler.handlePushMetrics controller %s not exist", payload.NodeID)
-		resultError(w, http.StatusBadRequest, fmt.Sprintf("controller %s not exist", payload.NodeID))
+	node, err := h.redis.GetNode(r.Context(), payload.NodeID)
+	if err != nil {
+		log.Error("ServerHandler.handlePushMetrics get node failed:", err.Error())
+		resultError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	c.AppList = apps
+
+	// c := h.devMgr.getController(payload.NodeID)
+	// if c == nil {
+	// 	log.Errorf("ServerHandler.handlePushMetrics controller %s not exist", payload.NodeID)
+	// 	resultError(w, http.StatusBadRequest, fmt.Sprintf("controller %s not exist", payload.NodeID))
+	// 	return
+	// }
+
+	recordRawIP(payload.NodeID, r)
+	ip := getClientIP(r)
+	if ip != "" {
+		node.IP = ip
+	}
+
+	for _, app := range apps {
+		if app.Metric == "" {
+			continue
+		}
+		m := metrics.NewMetricsString(app.Metric, app.Tag)
+		status, errStr := m.GetStatus()
+		clientid := m.GetClientID()
+		if clientid != "" {
+			// h.devMgr.updateController(c, redis.InitStateAfterFetchingClientIDMap[app.Tag])
+			h.devMgr.updateNode(r.Context(), payload.NodeID, node, redis.InitStateAfterFetchingClientIDMap[app.Tag])
+
+			// h.devMgr.updateNodeFromDevice()
+			// 只要有一个app运行成功 就running
+			break
+		}
+
+		if status == "running" {
+			// h.devMgr.updateController(c, redis.BizStateIniting)
+			h.devMgr.updateNode(r.Context(), payload.NodeID, node, redis.BizStateIniting)
+		}
+
+		if errStr != "running" && errStr != "" {
+			h.devMgr.updateNode(r.Context(), payload.NodeID, node, redis.BizStatusCodeErr)
+			// h.devMgr.updateController(c, redis.BizStatusCodeErr)
+		}
+	}
+
+	// c.AppList = apps
 }
 
+//------- logic changed --------------------
 // 1. 拉取旧app的metric
 // 2. 如果当前的app没有metric,则保留旧的metric
 // 3. 删除所有旧的app
 // 4. 保存当前的所有app
+
+// ------- 覆盖全部的指标信息 ------------------
 func (h *ServerHandler) updateNodeApps(nodeID string, apps []*App) error {
 	nodeApps := make([]*redis.NodeApp, 0, len(apps))
 	for _, app := range apps {
-		nodeApps = append(nodeApps, &redis.NodeApp{AppName: app.AppName, MD5: app.ScriptMD5, Metric: redis.MetricString(app.Metric)})
-	}
-	appNames, err := h.redis.GetNodeAppList(context.Background(), nodeID)
-	if err != nil {
-		return err
-	}
-
-	oldApps, err := h.redis.GetNodeApps(context.Background(), nodeID, appNames)
-	if err != nil {
-		return err
-	}
-
-	oldAppMap := make(map[string]*redis.NodeApp)
-	for _, app := range oldApps {
-		oldAppMap[app.AppName] = app
-	}
-
-	for _, app := range nodeApps {
-		if oldApp := oldAppMap[app.AppName]; oldApp != nil {
-			if len(app.Metric) == 0 && len(oldApp.Metric) != 0 {
-				app.Metric = oldApp.Metric
-			}
+		if app.AppName != "" {
+			nodeApps = append(nodeApps, &redis.NodeApp{AppName: app.AppName, MD5: app.ScriptMD5, Metric: app.Metric})
 		}
 	}
+	// appNames, err := h.redis.GetNodeAppList(context.Background(), nodeID)
+	// if err != nil {
+	// 	return err
+	// }
 
-	if err = h.redis.DeleteNodeApps(context.Background(), nodeID, appNames); err != nil {
-		return err
-	}
+	// oldApps, err := h.redis.GetNodeApps(context.Background(), nodeID, appNames)
+	// if err != nil {
+	// 	return err
+	// }
 
-	if err = h.redis.SetNodeApps(context.Background(), nodeID, nodeApps); err != nil {
+	// oldAppMap := make(map[string]*redis.NodeApp)
+	// for _, app := range oldApps {
+	// 	oldAppMap[app.AppName] = app
+	// }
+
+	// for _, app := range nodeApps {
+	// 	if oldApp := oldAppMap[app.AppName]; oldApp != nil {
+	// 		if len(app.Metric) != 0 && len(oldApp.Metric) != 0 {
+	// 			app.Metric = oldApp.Metric
+	// 		}
+	// 	}
+	// }
+
+	// if err = h.redis.DeleteNodeApps(context.Background(), nodeID, appNames); err != nil {
+	// 	return err
+	// }
+
+	if err := h.redis.SetNodeApps(context.Background(), nodeID, nodeApps); err != nil {
 		return err
 	}
 
@@ -767,7 +1234,7 @@ func (h *ServerHandler) HandleNodeRegist(w http.ResponseWriter, r *http.Request)
 	}
 
 	if _, err := titanrsa.Pem2PublicKey(pubKeyBytes); err != nil {
-		resultError(w, http.StatusBadRequest, "pub_key is invalid"+err.Error())
+		resultError(w, http.StatusBadRequest, "pub_key is invalid: "+err.Error())
 		return
 	}
 
@@ -843,6 +1310,8 @@ func (h *ServerHandler) HandleNodeLogin(w http.ResponseWriter, r *http.Request) 
 		NodeID: nodeid,
 	}
 
+	w.Header().Set("Web-Server", h.config.WebServer)
+
 	tk, err := h.auth.sign(payload)
 	if err != nil {
 		resultError(w, http.StatusBadRequest, fmt.Sprintf("sign jwt token failed: %s", err.Error()))
@@ -878,6 +1347,64 @@ func (h *ServerHandler) HandleNodeKeepalive(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+func (h *ServerHandler) HandleNextId(w http.ResponseWriter, r *http.Request) {
+	nextId, err := h.redis.GetSNNextID(r.Context())
+	if err != nil {
+		resultError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := json.NewEncoder(w).Encode(APIResult{Data: map[string]string{
+		"sn": nextId,
+	}}); err != nil {
+		log.Error("ServerHandler.handleSignVerify, Encode: ", err.Error())
+	}
+}
+
+func (h *ServerHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
+
+	// 1. check redis
+	if err := h.redis.Ping(r.Context()); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	// 2. xxx
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *ServerHandler) handleOnlineDurationByDate(w http.ResponseWriter, r *http.Request) {
+	date := r.URL.Query().Get("date")
+	if date == "" {
+		resultError(w, http.StatusBadRequest, "date is required")
+		return
+	}
+
+	list, err := h.redis.GetNodeList(r.Context(), time.Unix(0, 0), "")
+	if err != nil {
+		apiResultErr(w, err.Error())
+		return
+	}
+	var ret [][]string
+
+	for _, node := range list {
+		v, err := h.redis.GetNodeOnlineDurationByDate(r.Context(), node.ID, date)
+		if err != nil {
+			apiResultErr(w, fmt.Sprintf("failed to get online duration for node %s: %v", node.ID, err))
+			return
+		}
+
+		ret = append(ret, []string{node.ID, date, v})
+	}
+
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", `attachment; filename="online_duration.csv"`)
+	csvw := csv.NewWriter(w)
+	csvw.WriteAll(ret)
+	csvw.Flush()
+}
+
 func resultError(w http.ResponseWriter, statusCode int, errMsg string) {
 	w.WriteHeader(statusCode)
 	w.Write([]byte(errMsg))
@@ -896,8 +1423,19 @@ func apiResultErr(w http.ResponseWriter, errMsg string) {
 	}
 }
 
+func calUsage(node *redis.Node) {
+	if node.CPUCores == 0 && node.CPUUsage > 1 {
+		_, node.CPUUsage = math.Modf(node.CPUUsage)
+		return
+	}
+	node.CPUUsage = node.CPUUsage / float64(node.CPUCores)
+	if node.CPUUsage > 1 {
+		_, node.CPUUsage = math.Modf(node.CPUUsage)
+	}
+}
+
 // cpu/number memory/MB disk/GB
-func getResource(r *http.Request) (os string, cpu int, memory int64, disk int64) {
+func getResource(r *http.Request) (os string, cpu int, memory int64, disk int64, arch string) {
 	os = r.URL.Query().Get("os")
 
 	cpuStr := r.URL.Query().Get("cpu")
@@ -911,6 +1449,7 @@ func getResource(r *http.Request) (os string, cpu int, memory int64, disk int64)
 
 	diskBytes := stringToInt64(diskStr)
 	disk = diskBytes / (1024 * 1024 * 1024)
+	arch = r.URL.Query().Get("arch")
 	return
 }
 

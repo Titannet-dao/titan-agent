@@ -63,10 +63,10 @@ func New(args *AgentArguments) (*Agent, error) {
 		baseInfo:     NewBaseInfo(&agentInfo, nil),
 	}
 
-	err := os.MkdirAll(args.WorkingDir, os.ModePerm)
-	if err != nil {
-		return nil, err
-	}
+	// err := os.MkdirAll(args.WorkingDir, os.ModePerm)
+	// if err != nil {
+	// 	return nil, err
+	// }
 
 	return agent, nil
 }
@@ -131,7 +131,7 @@ func (a *Agent) updateScriptFromServer() {
 
 	newFileMD5 := fmt.Sprintf("%x", md5.Sum(buf))
 	if newFileMD5 != updateConfig.MD5 {
-		log.Errorf("Server script file md5 not match")
+		log.Errorf("Server script file md5 not match, new: %s, old: %s", newFileMD5, updateConfig.MD5)
 		return
 	}
 
